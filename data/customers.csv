@@ -1,0 +1,11 @@
+name,branch_id,handset,handset_price,emi_amount,tenure,emis_already_paid,next_unpaid_due_offset_days,paid_today,phone_label
+Ramesh Kumar,A,Samsung Galaxy M14,14999,1500,10,4,1,false,DEMO_CUSTOMER
+Sunita Devi,A,Redmi Note 12,16999,1700,10,3,3,false,919000010002
+Mohammed Irfan,A,Vivo Y27,15499,1550,10,5,-1,false,919000010003
+Anita Sharma,B,Realme C55,12999,1300,10,2,-35,false,919000010004
+Vijay Singh,B,Oppo A58,13999,1400,10,6,12,false,919000010005
+Pooja Verma,A,Apple iPhone 13,45999,4600,10,4,30,true,919000010006
+Deepak Yadav,B,Samsung Galaxy A34,25999,2600,10,7,30,true,919000010007
+Kavita Joshi,B,Poco X5,17999,1800,10,1,8,false,919000010008
+Suresh Patel,A,Realme Narzo 60,18999,1900,10,8,30,true,919000010009
+Farhan Ali,B,Redmi 12,10999,1100,10,3,-10,false,919000010010

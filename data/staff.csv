@@ -1,0 +1,4 @@
+name,phone_label,role,branch_id
+"Amit Singh (Collection, Branch A)",DEMO_COLLECTION,collection,A
+"Neha Gupta (Collection, Branch B)",919000000012,collection,B
+Rajesh Mehta (Manager),DEMO_MANAGER,manager,
