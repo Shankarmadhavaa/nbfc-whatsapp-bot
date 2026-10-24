@@ -1,118 +1,410 @@
-"""Full message handler with OTP verification, Gemini AI tool-calling, role checks, and handover."""
-import os
-import google.generativeai as genai
-from .repository import mask_phone, repo
-from datetime import date
 
-# Configure Gemini API
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+"""NBFC chatbot: OTP verification, role-based queries and handover."""
 
-ROLE_HI = {
-    "customer": "ग्राहक",
-    "collection": "कलेक्शन स्टाफ",
-    "manager": "मैनेजर",
-    "unknown": "अनजान नंबर",
-}
+import re
+import sqlite3
+from datetime import date, datetime, timedelta
+
+from .db import get_conn
+from .repository import repo
+
+
+DEMO_OTP = "1234"
+
+
+def _normalise(text: str) -> str:
+    return re.sub(r"\s+", " ", text.casefold()).strip()
+
+
+def _requests_human(text: str) -> bool:
+    t = _normalise(text)
+
+    phrases = (
+        "angry", "very angry", "furious", "speak to a human",
+        "talk to a human", "human manager", "real person",
+        "speak to manager", "talk to manager", "speak to an agent",
+        "customer care", "human support", "supervisor",
+        "file a complaint", "raise a complaint", "make a complaint",
+        "complaint", "fraud", "scam", "cheat", "police",
+        "gussa", "bakwaas", "shikayat", "dhokha",
+        "शिकायत", "धोखा", "गुस्सा", "मैनेजर से बात",
+        "इंसान से बात", "मानव सहायता", "कस्टमर केयर",
+    )
+    return any(phrase in t for phrase in phrases)
+
+
+def _requests_otp_resend(text: str) -> bool:
+    """Recognise explicit requests to start a fresh OTP challenge."""
+    t = _normalise(text)
+
+    phrases = (
+        "resend otp",
+        "send otp again",
+        "new otp",
+        "otp resend",
+        "request otp",
+        "otp expired",
+        "नया ओटीपी",
+        "ओटीपी दोबारा",
+        "ओटीपी फिर से",
+    )
+    return any(phrase in t for phrase in phrases)
+
+
+def _create_handover(phone: str, role: str, message: str) -> bool:
+    """Create or refresh a human-handover record."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO handover (phone, reason, started_at, active)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(phone) DO UPDATE SET
+                    reason = excluded.reason,
+                    started_at = excluded.started_at,
+                    active = 1
+                """,
+                (
+                    phone,
+                    f"Role: {role}. Request: {message[:1000]}",
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+        return True
+    except sqlite3.Error:
+        print("Handover database operation failed.")
+        return False
+
+
+def _customer_otp_gate(phone: str, text: str) -> str | None:
+    """Return a response if OTP processing is needed; otherwise None."""
+    try:
+        if repo.is_customer_verified(phone):
+            return None
+
+        state = repo.otp_challenge_state(phone)
+
+        if re.fullmatch(r"\d{4}", text):
+            success = repo.verify_customer_session(phone, text)
+
+            if success:
+                return (
+                    "आपका डेमो नंबर सत्यापित हो गया है। अब आप "
+                    "अगली EMI, बकाया राशि, लोन क्लोजर या "
+                    "भुगतान जानकारी पूछ सकते हैं।"
+                )
+
+            new_state = repo.otp_challenge_state(phone)
+
+            if new_state == "locked":
+                return (
+                    "OTP सत्यापन की अधिकतम कोशिशें पूरी हो गई हैं। "
+                    "नया डेमो OTP शुरू करने के लिए RESEND OTP भेजें।"
+                )
+
+            if new_state == "none":
+                return (
+                    "पहले OTP अनुरोध शुरू करें। OTP प्राप्त करने के "
+                    "लिए कोई सामान्य संदेश भेजें।"
+                )
+
+            return (
+                "OTP गलत है या समाप्त हो गया है। कृपया जाँचकर "
+                "दोबारा भेजें। यदि OTP समाप्त हो गया है या कोशिशें "
+                "पूरी हो गई हैं, तो RESEND OTP भेजें।"
+            )
+
+        if _requests_otp_resend(text):
+            repo.create_otp_session(phone, DEMO_OTP)
+            return (
+                "नया स्थानीय डेमो OTP सत्र शुरू हो गया है। "
+                "इस डेमो का OTP 1234 है। यह वास्तविक OTP संदेश नहीं है।"
+            )
+
+        if state == "active":
+            return (
+                "आपका OTP सत्र सक्रिय है। कृपया 4-अंकों का OTP भेजें। "
+                "इस स्थानीय डेमो में OTP 1234 है।"
+            )
+
+        if state in ("expired", "locked"):
+            return (
+                "आपका OTP सत्र समाप्त हो गया है या कोशिशों की सीमा "
+                "पूरी हो गई है। नया डेमो सत्र शुरू करने के लिए "
+                "RESEND OTP भेजें।"
+            )
+
+        # No challenge exists. Start the first local demo challenge.
+        repo.create_otp_session(phone, DEMO_OTP)
+        return (
+            "सुरक्षा के लिए OTP सत्यापन आवश्यक है। इस स्थानीय डेमो "
+            "में OTP 1234 है। वास्तविक OTP संदेश नहीं भेजा गया है।"
+        )
+
+    except Exception:
+        print("Customer OTP processing failed.")
+        return (
+            "अभी सुरक्षा सत्यापन नहीं हो पा रहा है। कृपया कुछ देर "
+            "बाद दोबारा प्रयास करें या अपनी ब्रांच से संपर्क करें।"
+        )
+
 
 def handle_message(phone: str, text: str) -> str:
-    user = repo.identify(phone)
-    role = user["role"]
+    """Main entry point used by the local simulator and WhatsApp webhook."""
+    if not isinstance(text, str) or not text.strip():
+        return "कृपया अपना सवाल लिखकर भेजें।"
 
-    if role == "unknown":
-        return "नमस्ते! आपका नंबर हमारे रिकॉर्ड में नहीं मिला। कृपया अपनी ब्रांच से संपर्क करें।"
+    if not isinstance(phone, str) or not phone.strip():
+        return "कृपया मान्य फोन नंबर से संपर्क करें।"
 
-    # 1. Human Handover / Anger Detection
-    angry_keywords = ["fraud", "police", "cheat", "gussa", "bakwaas", "frod", "scam", "शिकायत", "धोखा"]
-    if any(kw in text.lower() for kw in angry_keywords):
-        return "हमें खेद है कि आपको असुविधा हुई। हम आपकी बात तुरंत अपने सीनियर मैनेजर से जोड़ रहे हैं। कृपया प्रतीक्षा करें।"
+    phone = phone.strip()
+    text = text.strip()
 
-    # 2. Customer OTP Verification Gate
+    try:
+        user = repo.identify(phone)
+    except Exception:
+        print("User identification failed.")
+        return (
+            "अभी आपकी जानकारी प्राप्त नहीं हो पा रही है। "
+            "कृपया कुछ देर बाद दोबारा प्रयास करें।"
+        )
+
+    if not user or user.get("role") == "unknown":
+        return (
+            "नमस्ते! आपका नंबर हमारे रिकॉर्ड में नहीं मिला। "
+            "कृपया अपनी ब्रांच से संपर्क करें।"
+        )
+
+    role = user.get("role", "unknown")
+
+    # Handover requests take priority over normal questions.
+    if _requests_human(text):
+        if _create_handover(phone, role, text):
+            return (
+                "हमें खेद है कि आपको परेशानी हुई। आपका मानव सहायता "
+                "अनुरोध दर्ज कर दिया गया है। हमारी टीम उपलब्ध होने पर "
+                "आपसे संपर्क कर सकती है। यह डेमो है; कोई वास्तविक "
+                "सूचना या कॉल नहीं भेजी गई है।"
+            )
+
+        return (
+            "हम आपका मानव सहायता अनुरोध दर्ज नहीं कर पाए। "
+            "कृपया अपनी ब्रांच या आधिकारिक ग्राहक सहायता से संपर्क करें।"
+        )
+
     if role == "customer":
-        customer_id = user["id"]
-        # Check if verified in session
-        is_verified = repo.is_customer_verified(phone) # helper or direct db check
-        
-        # If user sends OTP or wants to verify
-        if "otp" in text.lower() or not is_verified:
-            if not is_verified and "1234" not in text: # Demo default OTP: 1234
-                repo.create_otp_session(phone, "1234")
-                return f"नमस्ते {user['name']} जी! सुरक्षा कारणों से, कृपया अपना 4-अंकों का OTP दर्ज करें (डिमोज़ के लिए '1234' भेजें)।"
-            elif "1234" in text:
-                repo.verify_customer_session(phone)
-                return "✅ आपका नंबर सत्यापित हो गया है! अब आप पूछ सकते हैं: 'मेरी अगली EMI कब है?', 'पेंडिंग कितना है?', या 'लोन बंद करने का कितना अमाउंट है?'"
-            else:
-                return "कृपया अपना लोन वेरिफाई करने के लिए OTP '1234' भेजें।"
+        otp_response = _customer_otp_gate(phone, text)
+        if otp_response is not None:
+            return otp_response
 
-    # 3. Staff / Verified Customer Query Processing using Gemini + Tools
     return process_with_ai(user, text)
 
 
 def process_with_ai(user: dict, text: str) -> str:
-    """Uses Gemini to parse user intent in Hindi and query the repository safely."""
+    """Route to deterministic handlers; this function calls no AI model."""
+    return fallback_rule_handler(user, text)
+
+
+def _matches(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _handle_customer(user: dict, text: str) -> str:
+    """Handle verified customer loan questions."""
+    loans = repo.get_loans_for_customer(user["id"])
+
+    if not loans:
+        return (
+            "आपके नाम पर कोई सक्रिय लोन नहीं मिला। "
+            "कृपया अपनी ब्रांच से संपर्क करें।"
+        )
+
+    loan = loans[0]
+    loan_no = loan["loan_no"]
+
+    if _matches(
+        text,
+        (
+            "foreclosure", "loan band", "loan close", "close my loan",
+            "close the loan", "loan closure", "loan closing",
+            "settle my loan", "full settlement", "loan khatam",
+            "लोन बंद", "लोन क्लोज", "लोन समाप्त", "फोरक्लोजर",
+        ),
+    ):
+        amount = loan.get("foreclosure_amount")
+
+        if amount is not None:
+            return (
+                f"डेमो लोन क्लोजर राशि ₹{amount} है। "
+                "भुगतान करने से पहले अपनी ब्रांच से अंतिम राशि की पुष्टि करें।"
+            )
+
+        return (
+            "लोन क्लोजर की अंतिम राशि उपलब्ध डेटा में नहीं है। "
+            "कृपया अपनी ब्रांच से आधिकारिक फोरक्लोजर कोटेशन लें।"
+        )
+
+    if _matches(
+        text,
+        (
+            "pending", "balance", "baki", "baaki", "outstanding",
+            "how much do i owe", "how much is due",
+            "loan amount remaining", "remaining balance",
+            "kitna baki", "बकाया", "बाकी राशि", "बैलेंस", "कितना बाकी",
+        ),
+    ):
+        summary = repo.get_pending_summary(loan_no)
+        return (
+            f"आपकी डेमो बकाया राशि ₹{summary['unpaid_total']} है। "
+            f"बकाया EMI की संख्या: {summary['unpaid_count']}।"
+        )
+
+    if _matches(
+        text,
+        (
+            "payment", "pay", "make my emi payment", "how can i pay",
+            "how do i pay", "payment method", "payment link",
+            "pay online", "bhugtan", "paisa kaise", "payment kaise",
+            "भुगतान", "पेमेंट", "पैसे कैसे",
+        ),
+    ):
+        emi = repo.get_next_emi(loan_no)
+
+        if not emi:
+            return (
+                "अभी कोई आगामी EMI नहीं मिली। भुगतान की जानकारी के "
+                "लिए कृपया अपनी ब्रांच से संपर्क करें।"
+            )
+
+        return (
+            f"आपकी अगली EMI ₹{emi['amount']} है और इसकी तारीख "
+            f"{emi['due_date']} है। यह डेमो है; वास्तविक भुगतान लिंक "
+            "कॉन्फ़िगर नहीं है। कृपया आधिकारिक भुगतान विवरण लें।"
+        )
+
+    if _matches(
+        text,
+        (
+            "next emi", "upcoming emi", "emi due", "emi date",
+            "when is my emi", "when is the next emi",
+            "next installment", "agli emi", "emi kab", "emi kitni",
+            "अगली किस्त", "अगली ईएमआई", "ईएमआई", "किस्त कब",
+        ),
+    ):
+        emi = repo.get_next_emi(loan_no)
+
+        if emi:
+            return (
+                f"आपकी अगली EMI ₹{emi['amount']} है, जिसकी देय "
+                f"तारीख {emi['due_date']} है।"
+            )
+
+        return "आपकी कोई आगामी EMI नहीं मिली। कृपया अपनी ब्रांच से संपर्क करें।"
+
+    return (
+        "नमस्ते! मैं इन विषयों में सहायता कर सकता हूँ: अगली EMI, "
+        "बकाया राशि, लोन क्लोजर और भुगतान जानकारी। कृपया इनमें से "
+        "किसी विषय के बारे में पूछें।"
+    )
+
+
+def _handle_staff(user: dict, text: str) -> str:
+    """Handle branch-scoped collection reports and manager reports."""
     role = user["role"]
-    
-    if not GEMINI_API_KEY:
-        # Fallback rule-based handler if API key is missing during offline demo testing
-        return fallback_rule_handler(user, text)
+    branch = user.get("branch_id") if role == "collection" else None
 
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""
-        You are an AI assistant for an Indian NBFC mobile phone loan company.
-        User Role: {role}
-        User Details: {user}
-        User Query (Hindi/English): "{text}"
+    if _matches(
+        text,
+        (
+            "due tomorrow", "emis due tomorrow", "emi due tomorrow",
+            "emi tomorrow", "tomorrow emi", "kal ki emi", "kal due",
+            "कल की ईएमआई", "कल की किस्त",
+        ),
+    ):
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        emis = repo.emis_due_on(tomorrow, branch)
 
-        Respond politely in natural Hindi. Do not calculate numbers yourself; use exact facts if provided, or answer based on standard NBFC workflows.
-        """
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return fallback_rule_handler(user, text)
+        if not emis:
+            return f"{tomorrow} के लिए कोई बकाया EMI देय नहीं है।"
+
+        lines = [f"{tomorrow} को देय EMIs:"]
+        for item in emis[:10]:
+            lines.append(
+                f"- {item['name']} ({item['loan_no']}), "
+                f"EMI #{item['emi_no']}: ₹{item['amount']}"
+            )
+
+        if len(emis) > 10:
+            lines.append(f"और {len(emis) - 10} रिकॉर्ड हैं।")
+
+        return "\n".join(lines)
+
+    if _matches(
+        text,
+        (
+            "overdue", "overdue list", "overdue loans", "show overdue",
+            "overdue accounts", "बकाया सूची", "ओवरड्यू",
+        ),
+    ):
+        overdues = repo.overdue_list(branch)
+
+        if not overdues:
+            return "कोई ओवरड्यू लोन नहीं मिला।"
+
+        lines = ["ओवरड्यू डेमो सूची:"]
+        for item in overdues[:10]:
+            lines.append(
+                f"- {item['name']} ({item['loan_no']}): "
+                f"₹{item['overdue_amount']}, "
+                f"{item['overdue_emis']} EMI बकाया"
+            )
+
+        if len(overdues) > 10:
+            lines.append(f"और {len(overdues) - 10} रिकॉर्ड हैं。")
+
+        return "\n".join(lines)
+
+    if _matches(
+        text,
+        (
+            "collection", "today", "today collection",
+            "today's collection", "daily collection",
+            "collection report", "aaj", "aaj ka collection",
+            "आज का कलेक्शन", "आज की वसूली", "कलेक्शन",
+        ),
+    ):
+        collection = repo.todays_collection(branch)
+        return (
+            f"आज का डेमो कलेक्शन ₹{collection['total']} है। "
+            f"कुल भुगतान: {collection['count']}।"
+        )
+
+    return (
+        "नमस्ते! आप इन रिपोर्टों के बारे में पूछ सकते हैं: "
+        "कल देय EMI, ओवरड्यू सूची या आज का कलेक्शन।"
+    )
 
 
 def fallback_rule_handler(user: dict, text: str) -> str:
-    """Offline deterministic fallback for reliable demo execution."""
-    role = user["role"]
-    t = text.lower()
+    """Route messages according to the identified role."""
+    role = user.get("role", "unknown")
+    normalised_text = _normalise(text)
 
-    if role == "customer":
-        loans = repo.get_loans_for_customer(user["id"])
-        if not loans:
-            return "आपके नाम पर कोई सक्रिय लोन नहीं मिला।"
-        loan = loans[0]
-        loan_no = loan["loan_no"]
+    try:
+        if role == "customer":
+            return _handle_customer(user, normalised_text)
 
-        if "emi" in t or "अगली" in t or "next" in t:
-            emi = repo.get_next_emi(loan_no)
-            if emi:
-                return f"आपकी अगली EMI ₹{emi['amount']} की है, जो दिनांक {emi['due_date']} को देय है। भुगतान लिंक: https://pay.example.com/{loan_no}"
-            return "आपकी सभी EMI का भुगतान हो चुका है।"
-        
-        elif "pending" in t or "बाकी" in t or "pending" in t:
-            summary = repo.get_pending_summary(loan_no)
-            return f"आपका कुल बकाया शेष (Pending Balance) ₹{summary['unpaid_total']} है (कुल {summary['unpaid_count']} EMI बाकी)।"
-        
-        elif "closure" in t or "foreclosure" in t or "लोन बंद" in t:
-            return f"आपका लोन बंद (Foreclosure) करने की कुल राशि ₹{loan['foreclosure_amount']} है।"
-        
-        elif "pay" in t or "लिंक" in t or "payment" in t:
-            return f"यहाँ आपका ऑनलाइन भुगतान लिंक है: https://pay.example.com/{loan_no}?amt={loan['next_emi_amount']}"
+        if role in ("collection", "manager"):
+            return _handle_staff(user, normalised_text)
 
-    elif role in ["collection", "manager"]:
-        branch = user.get("branch") if role == "collection" else None
-        
-        if "collection" in t or "आज" in t or "today" in t:
-            col = repo.todays_collection(branch)
-            return f"आज का कुल कलेक्शन: ₹{col['total']} ({col['count']} भुगतान प्राप्त हुए)।"
-        
-        elif "overdue" in t or "बकाया" in t:
-            overdues = repo.overdue_list(branch)
-            msg = "🔴 ओवरड्यू लिस्ट:\n"
-            for o in overdues[:5]:
-                msg += f"- {o['name']} ({o['loan_no']}): ₹{o['overdue_amount']} ({o['overdue_emis']} EMI बाकी)\n"
-            return msg or "कोई ओवरड्यू लोन नहीं मिला।"
+        return (
+            "नमस्ते! आपका नंबर हमारे रिकॉर्ड में नहीं मिला। "
+            "कृपया अपनी ब्रांच से संपर्क करें।"
+        )
 
-    return "नमस्ते! मैं आपकी किस प्रकार सहायता कर सकता हूँ? आप अपनी EMI, पेंडिंग बैलेंस या पेमेंट लिंक के बारे में पूछ सकते हैं।"
+    except (sqlite3.Error, KeyError, TypeError, ValueError):
+        print(f"Message handling failed for role {role}.")
+        return (
+            "आपकी जानकारी प्राप्त करते समय एक समस्या हुई। "
+            "कृपया कुछ देर बाद दोबारा प्रयास करें या अपनी ब्रांच से संपर्क करें।"
+        )

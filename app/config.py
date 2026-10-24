@@ -16,5 +16,6 @@ DEMO_MANAGER_PHONE = os.getenv("DEMO_MANAGER_PHONE", "919000000003").split("#")[
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").split("#")[0].strip()
 DB_PATH = os.getenv("DB_PATH", "nbfc_demo.db").split("#")[0].strip()
 
+PRODUCTION = os.getenv("APP_ENV", "development").strip().lower() == "production"
 # If no WhatsApp token is set, messages are printed to the console instead of being sent (dry-run).
 DRY_RUN = not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID)
